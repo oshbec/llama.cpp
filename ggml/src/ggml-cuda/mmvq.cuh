@@ -1,6 +1,13 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// Max. ncols_dst for which the fused (gate/GLU, bias) MMVQ kernels are instantiated. Fusion at ncols_dst 2-4 is only
+// enabled on RDNA4 (ggml_cuda_should_fuse_mul_mat_vec_q), so CUDA builds keep 1 and do not compile the extra kernels.
+#if defined(GGML_USE_HIP)
+#define MMVQ_MAX_FUSED_NCOLS_DST 4
+#else
+#define MMVQ_MAX_FUSED_NCOLS_DST 1
+#endif // defined(GGML_USE_HIP)
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
