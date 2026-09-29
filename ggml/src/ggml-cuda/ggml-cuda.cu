@@ -2976,7 +2976,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * ignore_src  = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3008,7 +3009,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                if (!src || src->op == GGML_OP_NONE || src == ignore_src) {
                     continue;
                 }
 
@@ -3077,7 +3078,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            // The fused MMVQ path (taken by ggml_cuda_try_fuse when MMVF does not apply) reads the shared F32 src1
+            // only in quantize_row_q8_1_cuda, which writes a pool buffer before the dot kernel runs on the same
+            // stream. The GLU output may therefore reuse src1's memory. MMVF reads src1 inside the dot kernel,
+            // so it keeps the full check.
+            const bool mmvq_reads_src1_first = !ggml_cuda_should_fuse_mul_mat_vec_f(ffn_up) &&
+                                               ggml_cuda_should_fuse_mul_mat_vec_q(ffn_up);
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false,
+                                                        mmvq_reads_src1_first ? ffn_up->src[1] : nullptr);
         }
     }
 
