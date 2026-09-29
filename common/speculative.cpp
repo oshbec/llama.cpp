@@ -2097,6 +2097,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// Backend argmax for greedy MTP drafts (p_min == 0 only needs the top-1 id).
+// Unlike llama_sampler_init_greedy(), backend_apply drops data->logits, so only the
+// sampled id (4 bytes) is copied to the host instead of the full n_vocab logits row.
+// The top_k(10) chain it replaces has no backend TOP_K on HIP for n_vocab > 1024 and
+// silently fell back to CPU: full-vocab D2H + candidate build + partial sort per step.
+// Picks the same token as top-1 of top_k (max logit); only exact logit ties may differ.
+static const char * mtp_argmax_name(const llama_sampler * /*smpl*/) {
+    return "mtp-argmax";
+}
+
+static void mtp_argmax_apply(llama_sampler * /*smpl*/, llama_token_data_array * cur_p) {
+    cur_p->selected = 0;
+    for (size_t i = 1; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit > cur_p->data[cur_p->selected].logit) {
+            cur_p->selected = i;
+        }
+    }
+}
+
+static llama_sampler * mtp_argmax_init();
+
+static llama_sampler * mtp_argmax_clone(const llama_sampler * /*smpl*/) {
+    return mtp_argmax_init();
+}
+
+static bool mtp_argmax_backend_init(llama_sampler * /*smpl*/, ggml_backend_buffer_type_t buft, uint32_t /*n_outputs_max_per_seq*/) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        return true;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * logits = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1024*1024);
+    ggml_tensor * am     = ggml_argmax(ctx.get(), logits);
+
+    return ggml_backend_dev_supports_op(dev, am);
+}
+
+static void mtp_argmax_backend_apply(llama_sampler * /*smpl*/, ggml_context * ctx, ggml_cgraph * /*gf*/, llama_sampler_data * data) {
+    ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    ggml_tensor * am     = ggml_argmax(ctx, logits);
+    ggml_set_name(am, "mtp_argmax");
+
+    data->sampled    = am;
+    data->logits     = nullptr;
+    data->probs      = nullptr;
+    data->candidates = nullptr;
+}
+
+static llama_sampler_i mtp_argmax_i = {
+    /* .name              = */ mtp_argmax_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ mtp_argmax_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ mtp_argmax_clone,
+    /* .free              = */ nullptr,
+    /* .backend_init      = */ mtp_argmax_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ mtp_argmax_backend_apply,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+static llama_sampler * mtp_argmax_init() {
+    return llama_sampler_init(&mtp_argmax_i, nullptr);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -2106,6 +2183,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
+
+    // greedy draft via backend argmax (p_min == 0); per step falls back to the CPU
+    // sampler when the backend did not produce a sampled token
+    bool use_argmax = false;
 
     int32_t n_embd = 0;
 
@@ -2172,11 +2253,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // offload draft sampling to the backend
+        // p_min == 0 only needs the top-1 id, so use a backend argmax (see mtp_argmax_*);
+        // p_min > 0 keeps the top_k(10) chain (needs candidate probabilities on the host)
+        use_argmax = this->params.p_min <= 0.0f;
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, use_argmax ? mtp_argmax_init() : llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -2186,6 +2270,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 backend_chains[seq_id] = chain;
             }
         }
+        SPC_TRC("- draft sampler: %s\n", use_argmax ? "backend argmax (greedy, p_min == 0)" : "top_k(10)");
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -2437,27 +2522,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id = LLAMA_TOKEN_NULL;
+
+                if (use_argmax && backend_chains[seq_id] != nullptr) {
+                    // greedy draft: the backend argmax already picked the token, no logits on the host
+                    llama_synchronize(ctx_dft);
+                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
+                    SPC_DBG(" - seq_id %d, draft argmax, pos %3d: %6d '%s'\n",
+                            seq_id, i, id, id == LLAMA_TOKEN_NULL ? "" : common_token_to_piece(ctx_dft, id).c_str());
+                }
+
+                if (id == LLAMA_TOKEN_NULL) {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id = cur_p->data[0].id;
+
+                    // only collect very high-confidence draft tokens
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+                }
+
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
 
                 common_sampler_accept(smpl, id, true);
 
