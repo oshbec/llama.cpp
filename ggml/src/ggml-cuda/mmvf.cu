@@ -783,7 +783,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+static bool ggml_cuda_mmvf_src0_supported(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb) {
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -798,6 +798,27 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         if (src0_nb[i] % (2*ts) != 0) {
             return false;
         }
+    }
+
+    return true;
+}
+
+// RDNA4: small BF16 batches that MMF rejects (e.g. ne01 % 32 != 0, such as the 48-row ssm_alpha/ssm_beta
+// of qwen35) would otherwise fall back to hipBLAS, which on gfx1201 only has slow fallback Tensile kernels
+// (~270 us per tiny GEMM) and rounds src1 to BF16. MMVF supports up to MMVF_MAX_BATCH_SIZE columns.
+bool ggml_cuda_should_use_mmvf_bf16_fallback(int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+#if defined(GGML_USE_HIP)
+    return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVF_MAX_BATCH_SIZE &&
+        ggml_cuda_mmvf_src0_supported(GGML_TYPE_BF16, src0_ne, src0_nb);
+#else
+    GGML_UNUSED_VARS(cc, src0_ne, src0_nb, ne11);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+    if (!ggml_cuda_mmvf_src0_supported(type, src0_ne, src0_nb)) {
+        return false;
     }
 
     switch (type) {

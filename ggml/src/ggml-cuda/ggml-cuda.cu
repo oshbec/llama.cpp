@@ -1860,6 +1860,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (src0->type == GGML_TYPE_BF16 && src1->nb[0] == ggml_type_size(src1->type)
+            && ggml_cuda_should_use_mmvf_bf16_fallback(cc, src0->ne, src0->nb, ne11)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
