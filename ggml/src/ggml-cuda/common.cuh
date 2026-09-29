@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1453,10 +1454,45 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// HIP: q8_1 activation cache for MMVQ, valid within one graph evaluation (see mmvq.cu).
+// Sibling GEMVs that read the same F32 activation (GDN qkv + z, attention q/k/v, unfused
+// gate/up in the multi-token verify pass) reuse one quantize_q8_1 result, and the FWHT
+// kernel can write the q8_1 copy of its output directly. The slots live in one persistent
+// device buffer so the addresses stay valid across HIP graph capture and replay.
+struct ggml_cuda_q8_cache {
+    static constexpr int    n_slots   = 4;
+    static constexpr size_t slot_size = 256*1024; // >= 17408 x 8 columns of block_q8_1 (157 KB)
+
+    struct entry {
+        bool         valid    = false;
+        bool         flat     = false; // contiguous src1 with ne10 % MATRIX_ROW_PADDING == 0: blocks in flat element order
+        const char * data     = nullptr;
+        size_t       nbytes   = 0;     // F32 bytes the entry was quantized from
+        int64_t      ne[4]    = {0, 0, 0, 0};
+        size_t       nb[4]    = {0, 0, 0, 0};
+        int          block    = -1;    // first graph node index of the block that populated the entry
+        uint64_t     last_use = 0;
+    };
+
+    char *   buf       = nullptr;
+    bool     active    = false; // only inside ggml_cuda_graph_evaluate_and_capture
+    bool     fwht_emit = false; // FWHT may write q8_1 for MMVQ consumers (step 2)
+    int      cur_block = -1;
+    uint64_t tick      = 0;
+    entry    slots[n_slots];
+    // FWHT emission lookahead: sorted (view root tensor, data, nbytes) of the contiguous src1 of every MMVQ-bound
+    // MUL_MAT in the current graph
+    std::vector<std::tuple<uintptr_t, uintptr_t, size_t>> mmvq_src1;
+
+    int64_t n_hit = 0, n_miss = 0, n_inval = 0, n_emit = 0, n_graphs = 0; // host-side stats for GGML_HIP_Q8_CACHE_DEBUG=1
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_q8_cache q8_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

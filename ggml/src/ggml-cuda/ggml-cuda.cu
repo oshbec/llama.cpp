@@ -707,6 +707,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_cache.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(q8_cache.buf));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4294,8 +4298,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // q8_1 activation cache for MMVQ (HIP, see mmvq.cu); main stream only.
+            ggml_cuda_q8_cache_begin(*cuda_ctx, cgraph, !should_launch_concurrent_events);
+            int q8_cache_block = -1;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (cuda_ctx->q8_cache.active) {
+                    if (q8_cache_block >= 0) {
+                        ggml_cuda_q8_cache_after_block(*cuda_ctx, cgraph, q8_cache_block, i - 1);
+                    }
+                    q8_cache_block = i;
+                    ggml_cuda_q8_cache_set_block(*cuda_ctx, i);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4478,6 +4493,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_q8_cache_end(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH

@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <tuple>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1356,6 +1357,256 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// q8_1 activation cache (HIP). One MMVQ launch = quantize_q8_1(src1) + GEMV. Sibling GEMVs that read the same F32
+// activation (GDN qkv + z, attention q/k/v, the unfused gate/up of the multi-token verify pass) quantize it again,
+// byte for byte. Within one graph evaluation this cache keeps the q8_1 copy of an activation in a persistent slot
+// and later MMVQs with the same src1 (same data pointer and layout) skip their quantize. The FWHT kernel can also
+// fill a slot directly when its output feeds MMVQ, so those activations are never quantized separately.
+//
+// Correctness: an entry is dropped as soon as any later executed node may have written to the F32 range it was
+// quantized from (ggml_cuda_q8_cache_after_block), so a hit always sees bytes identical to what the skipped
+// quantize would have written. Only the main stream is used (disabled when concurrent streams are active).
+// Invariant this relies on: every executed node writes only inside its own [data, alloc_size) range, and inside a
+// fused group an MMVQ reads src1 before anything in the group writes. Both hold for every current fusion; an op or
+// fusion that breaks them would silently read stale q8_1. Check new fusions with GGML_HIP_Q8_CACHE=0 (outputs must
+// be byte-identical) and the GGML_HIP_Q8_CACHE_DEBUG counters (qwen35 decode: hit 337, miss 0, fwht-emit 257).
+// GGML_HIP_Q8_CACHE=0 disables the cache, GGML_HIP_FWHT_Q8=0 only the FWHT emission, GGML_HIP_Q8_CACHE_DEBUG=1
+// prints hit/miss counters per graph evaluation to stderr.
+
+static bool ggml_cuda_q8_cache_env(const char * name) {
+    const char * env = getenv(name);
+    return !env || atoi(env) != 0;
+}
+
+static bool ggml_cuda_q8_cache_debug() {
+    static const bool debug = getenv("GGML_HIP_Q8_CACHE_DEBUG") != nullptr && atoi(getenv("GGML_HIP_Q8_CACHE_DEBUG")) != 0;
+    return debug;
+}
+
+static bool ggml_cuda_q8_cache_flat_ok(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] % MATRIX_ROW_PADDING == 0;
+}
+
+// Lookahead key: the tensor that owns the memory (reshape/view chains resolved) plus the flat-match fields.
+// Keying on the owner, not only the address, skips an FWHT output that no MMVQ reads even though a later MMVQ
+// src1 happens to reuse its address and size (graph allocator reuse).
+static std::tuple<uintptr_t, uintptr_t, size_t> ggml_cuda_q8_cache_lookahead_key(const ggml_tensor * t) {
+    const ggml_tensor * root = t;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    return { (uintptr_t) root, (uintptr_t) t->data, ggml_nbytes(t) };
+}
+
+// Would ggml_cuda_mul_mat route this node to ggml_cuda_mul_mat_vec_q? (quantized src0 never takes mmvf/mmf)
+static bool ggml_cuda_q8_cache_node_uses_mmvq(const ggml_tensor * node, int cc) {
+    if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1]) {
+        return false;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+        src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+}
+
+void ggml_cuda_q8_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, bool allow) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    c.active = false;
+    c.cur_block = -1;
+    for (auto & e : c.slots) {
+        e.valid = false;
+    }
+    c.mmvq_src1.clear();
+#if defined(GGML_USE_HIP)
+    static const bool enabled   = ggml_cuda_q8_cache_env("GGML_HIP_Q8_CACHE");
+    static const bool fwht_emit = ggml_cuda_q8_cache_env("GGML_HIP_FWHT_Q8");
+    if (!allow || !enabled) {
+        return;
+    }
+    if (c.buf == nullptr) {
+        // Allocate outside of stream capture only; graph warmup always runs eagerly first.
+#ifdef USE_CUDA_GRAPH
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return;
+        }
+#endif // USE_CUDA_GRAPH
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc((void **) &c.buf, ggml_cuda_q8_cache::n_slots*ggml_cuda_q8_cache::slot_size));
+    }
+    c.active    = true;
+    c.fwht_emit = fwht_emit;
+    if (fwht_emit) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (ggml_cuda_q8_cache_node_uses_mmvq(node, cc) && ggml_cuda_q8_cache_flat_ok(node->src[1])) {
+                c.mmvq_src1.push_back(ggml_cuda_q8_cache_lookahead_key(node->src[1]));
+            }
+        }
+        std::sort(c.mmvq_src1.begin(), c.mmvq_src1.end());
+    }
+    c.n_graphs++;
+#else
+    GGML_UNUSED_VARS(cgraph, allow);
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q8_cache_end(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    if (c.active && ggml_cuda_q8_cache_debug()) {
+        fprintf(stderr, "q8 cache: graph %lld: hit %lld miss %lld fwht-emit %lld invalidated %lld\n",
+            (long long) c.n_graphs, (long long) c.n_hit, (long long) c.n_miss, (long long) c.n_emit, (long long) c.n_inval);
+    }
+    c.n_hit = c.n_miss = c.n_emit = c.n_inval = 0;
+    c.active = false;
+    for (auto & e : c.slots) {
+        e.valid = false;
+    }
+}
+
+void ggml_cuda_q8_cache_set_block(ggml_backend_cuda_context & ctx, int first) {
+    ctx.q8_cache.cur_block = first;
+}
+
+void ggml_cuda_q8_cache_after_block(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int first, int last) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    if (!c.active) {
+        return;
+    }
+    bool any = false;
+    for (const auto & e : c.slots) {
+        any = any || e.valid;
+    }
+    if (!any) {
+        return;
+    }
+    for (int j = first; j <= last && j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->data == nullptr || ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue; // no write
+        }
+        size_t size = ggml_nbytes(node);
+        if (node->buffer) {
+            size = std::max(size, ggml_backend_buffer_get_alloc_size(node->buffer, node));
+        }
+        const char * w0 = (const char *) node->data;
+        const char * w1 = w0 + size;
+        for (auto & e : c.slots) {
+            // entries populated in this block describe data as of the end of this block (e.g. FWHT output)
+            if (!e.valid || e.block == first) {
+                continue;
+            }
+            if (w0 < e.data + e.nbytes && e.data < w1) {
+                e.valid = false;
+                c.n_inval++;
+            }
+        }
+    }
+}
+
+static bool ggml_cuda_q8_cache_match(const ggml_cuda_q8_cache::entry & e, const ggml_tensor * src1, bool flat) {
+    if (!e.valid || e.data != (const char *) src1->data) {
+        return false;
+    }
+    if (e.flat && flat) {
+        return e.nbytes == ggml_nbytes(src1);
+    }
+    if (e.flat || flat) {
+        return false;
+    }
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        if (e.ne[k] != src1->ne[k] || e.nb[k] != src1->nb[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void * ggml_cuda_q8_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    const bool flat = ggml_cuda_q8_cache_flat_ok(src1);
+    for (int s = 0; s < ggml_cuda_q8_cache::n_slots; ++s) {
+        ggml_cuda_q8_cache::entry & e = c.slots[s];
+        if (ggml_cuda_q8_cache_match(e, src1, flat)) {
+            e.last_use = ++c.tick;
+            return c.buf + s*ggml_cuda_q8_cache::slot_size;
+        }
+    }
+    return nullptr;
+}
+
+// Claims the least recently used slot for src1's q8_1 copy. The caller must enqueue the write before returning to the graph loop.
+static void * ggml_cuda_q8_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, size_t q8_size) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    if (q8_size > ggml_cuda_q8_cache::slot_size) {
+        return nullptr;
+    }
+    int best = 0;
+    for (int s = 0; s < ggml_cuda_q8_cache::n_slots; ++s) {
+        const ggml_cuda_q8_cache::entry & e = c.slots[s];
+        if (!e.valid) {
+            best = s;
+            break;
+        }
+        if (e.last_use < c.slots[best].last_use) {
+            best = s;
+        }
+    }
+    ggml_cuda_q8_cache::entry & e = c.slots[best];
+    e.valid    = true;
+    e.flat     = ggml_cuda_q8_cache_flat_ok(src1);
+    e.data     = (const char *) src1->data;
+    e.nbytes   = ggml_nbytes(src1);
+    e.block    = c.cur_block;
+    e.last_use = ++c.tick;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        e.ne[k] = src1->ne[k];
+        e.nb[k] = src1->nb[k];
+    }
+    return c.buf + best*ggml_cuda_q8_cache::slot_size;
+}
+
+static void ggml_cuda_q8_cache_drop(ggml_backend_cuda_context & ctx, const void * slot_ptr) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    for (int s = 0; s < ggml_cuda_q8_cache::n_slots; ++s) {
+        if (c.buf + s*ggml_cuda_q8_cache::slot_size == slot_ptr) {
+            c.slots[s].valid = false;
+        }
+    }
+}
+
+void * ggml_cuda_q8_cache_fwht_dst(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    ggml_cuda_q8_cache & c = ctx.q8_cache;
+    if (!c.active || !c.fwht_emit || ctx.curr_stream_no != 0 || !ggml_cuda_q8_cache_flat_ok(dst)) {
+        return nullptr;
+    }
+    if (!std::binary_search(c.mmvq_src1.begin(), c.mmvq_src1.end(), ggml_cuda_q8_cache_lookahead_key(dst))) {
+        return nullptr;
+    }
+    // The FWHT overwrites dst: any older entry quantized from an overlapping range is stale from here on.
+    // (ggml_cuda_q8_cache_after_block drops it too once this block ends; doing it here keeps insert() safe on its own.)
+    {
+        const char * w0 = (const char *) dst->data;
+        const char * w1 = w0 + ggml_nbytes(dst);
+        for (auto & e : c.slots) {
+            if (e.valid && w0 < e.data + e.nbytes && e.data < w1) {
+                e.valid = false;
+                c.n_inval++;
+            }
+        }
+    }
+    void * q8 = ggml_cuda_q8_cache_insert(ctx, dst, ggml_nelements(dst)/QK8_1*sizeof(block_q8_1));
+    if (q8) {
+        c.n_emit++;
+    }
+    return q8;
+}
+// ---------------------------------------------------------------------------------------------------------------------
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1434,12 +1685,42 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  src1_q8_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // q8_1 activation cache (see above): reuse a sibling's quantized src1, or quantize into a cache slot.
+    const bool use_q8_cache = ctx.q8_cache.active && !ids && ctx.curr_stream_no == 0 && ne11 <= MMVQ_MAX_BATCH_SIZE;
+    const void * src1_q8_cached = nullptr;
+    if (use_q8_cache) {
+        src1_q8_cached = ggml_cuda_q8_cache_find(ctx, src1);
+        if (src1_q8_cached) {
+            ctx.q8_cache.n_hit++;
+        }
+    }
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!src1_q8_cached) {
+        void * q8_dst = nullptr;
+        if (use_q8_cache) {
+            ctx.q8_cache.n_miss++;
+            q8_dst = ggml_cuda_q8_cache_insert(ctx, src1, src1_q8_size);
+        }
+        const bool in_cache = q8_dst != nullptr;
+        if (!q8_dst) {
+            q8_dst = src1_q8_1.alloc(src1_q8_size);
+        }
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, q8_dst, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_cached = q8_dst;
+
+        // The GEMV output may overwrite src1 (e.g. a fused GLU output reusing its memory): do not keep the entry then.
+        if (in_cache) {
+            const char * d0 = (const char *) dst->data;
+            const char * s0 = (const char *) src1->data;
+            if (d0 < s0 + ggml_nbytes(src1) && s0 < d0 + ggml_nbytes(dst)) {
+                ggml_cuda_q8_cache_drop(ctx, q8_dst);
+            }
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1465,7 +1746,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_cached, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

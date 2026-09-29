@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "mmvq.cuh"
 
 #include <cstdlib>
 
@@ -129,15 +130,49 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 }
 
 
+// xor-lane exchange within 32 lanes. On RDNA3/4 (wave32) the constant offsets map to DPP / v_permlanex16
+// instead of ds_bpermute (no LDS round trip): ~0.1 us less per FWHT with q8_1 emission. Same partner lane,
+// so a butterfly built on it computes exactly what warp_reduce_max/sum (__shfl_xor_sync) compute.
+template <int offset>
+static __device__ __forceinline__ float fwht_shfl_xor32(const float x) {
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+    const int xi = __float_as_int(x);
+    if constexpr (offset == 16) {
+        return __int_as_float(__builtin_amdgcn_permlanex16(xi, xi, 0x76543210, 0xfedcba98, false, false));
+    } else if constexpr (offset == 8) {
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, xi, 0x168, 0xf, 0xf, false)); // row_xmask:8
+    } else if constexpr (offset == 4) {
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, xi, 0x164, 0xf, 0xf, false)); // row_xmask:4
+    } else if constexpr (offset == 2) {
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, xi, 0x4e, 0xf, 0xf, false));  // quad_perm [2,3,0,1]
+    } else {
+        static_assert(offset == 1, "bad offset");
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, xi, 0xb1, 0xf, 0xf, false));  // quad_perm [1,0,3,2]
+    }
+#else
+    return __shfl_xor_sync(0xffffffff, x, offset, 32);
+#endif
+}
+
+// One stage of the q8_1 max/sum butterfly over NE independent chains.
+template <int offset, int NE>
+static __device__ __forceinline__ void fwht_q8_reduce_stage(float * amax, float * sum) {
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        amax[i] = fmaxf(amax[i], fwht_shfl_xor32<offset>(amax[i]));
+        sum[i] += fwht_shfl_xor32<offset>(sum[i]);
+    }
+}
+
 // Wide rows at small row counts (decode): one row per block instead of per warp.
 // The warp kernel serialises every stage on one warp, and the shared-memory kernel above synchronises on each stage.
 // Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT, typename T, bool has_signs>
+template <int N, int NT, typename T, bool has_signs, bool emit_q8 = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk) {
+                                const float * signs, const int n_blk, block_q8_1 * dst_q8) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -215,12 +250,58 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
     }
+
+    // Optional q8_1 copy of the output for MMVQ consumers (q8 activation cache, mmvq.cu). With a 32-wide warp,
+    // register i of a warp holds 32 consecutive outputs, lane == position in the q8_1 block, exactly as in
+    // quantize_q8_1 (quantize.cu). Same reductions and expressions, so the bytes (including ds.y) are identical.
+    if constexpr (emit_q8 && warp_size == QK8_1) {
+        block_q8_1 * y = dst_q8 + r * (N / QK8_1);
+
+        // All NE reductions run interleaved (independent shuffle chains), each one exactly the xor butterfly of
+        // warp_reduce_max<QK8_1> / warp_reduce_sum<QK8_1>, so the results are bit-identical to quantize_q8_1.
+        float amax[NE];
+        float sum[NE];
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            amax[i] = fabsf(reg[i]);
+            sum[i]  = reg[i];
+        }
+        static_assert(QK8_1 == 32, "the reduction below assumes 32-element blocks");
+        fwht_q8_reduce_stage<16, NE>(amax, sum);
+        fwht_q8_reduce_stage< 8, NE>(amax, sum);
+        fwht_q8_reduce_stage< 4, NE>(amax, sum);
+        fwht_q8_reduce_stage< 2, NE>(amax, sum);
+        fwht_q8_reduce_stage< 1, NE>(amax, sum);
+
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            const float  xi = reg[i];
+            const float  d  = amax[i] / 127.0f;
+            const int8_t q  = amax[i] == 0.0f ? 0 : roundf(xi / d);
+
+            const int ie = i * NT + tid;
+            y[ie / QK8_1].qs[ie % QK8_1] = q;
+            if (lane == 0) {
+                y[ie / QK8_1].ds = make_half2(d, sum[i]);
+            }
+        }
+    }
+}
+
+static bool fwht_legacy() {
+    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    return legacy;
+}
+
+// Sizes that fwht_launch sends to fwht_cuda_block (the only kernel that can emit q8_1).
+static bool fwht_uses_block_kernel(const int n) {
+    return !fwht_legacy() && (n == 512 || n == 1024 || n == 2048 || n == 4096 || n == 8192);
 }
 
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
-                        const float * signs, const int n_blk) {
+                        const float * signs, const int n_blk, block_q8_1 * dst_q8 = nullptr) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
     const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
@@ -263,15 +344,18 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
-            if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+            if (dst_q8 && signs) { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, dst_q8); \
+            } else if (dst_q8) { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false, true>, lp, src_d, dst_d, rows, scale, nullptr, 1, dst_q8); \
+            } else if (signs) { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, (block_q8_1 *) nullptr); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, (block_q8_1 *) nullptr); \
             } \
             return true; \
         }
-    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
-    if (legacy) {
+    if (fwht_legacy()) {
         switch (n) {
             FWHT_CASE(512)
             FWHT_CASE(1024)
@@ -322,10 +406,15 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     float * dst_d = (float *) dst->data;
     const float scale = 1 / sqrtf(n);
 
-    if (src->type == GGML_TYPE_F32) {
-        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk);
+    // q8_1 copy of the output for MMVQ consumers (only the block kernel with 32-wide warps can write it).
+    block_q8_1 * dst_q8 = nullptr;
+    if (fwht_uses_block_kernel(n) && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == QK8_1) {
+        dst_q8 = (block_q8_1 *) ggml_cuda_q8_cache_fwht_dst(ctx, dst);
     }
-    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk);
+
+    return src->type == GGML_TYPE_F32 ?
+        fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk, dst_q8) :
+        fwht_launch<half> (ctx, (const half  *) src->data, dst_d, n, rows, scale, signs, n_blk, dst_q8);
 }
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
