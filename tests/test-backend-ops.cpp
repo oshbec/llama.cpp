@@ -6084,6 +6084,33 @@ struct test_conv_3d : public test_case {
 };
 
 // GGML_OP_CONCAT
+// GGML_OP_CONCAT: small contiguous state ++ transposed view along dim 0
+// (qwen35/qwen3next GDN conv-state update; hits concat_dim0_transpose_u32 on DGX Spark / RDNA4)
+struct test_concat_transpose : public test_case {
+    const int64_t n_state;
+    const int64_t n_channels;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_state, n_channels, n_tokens);
+    }
+
+    test_concat_transpose(int64_t n_state = 3, int64_t n_channels = 10240, int64_t n_tokens = 4)
+        : n_state(n_state), n_channels(n_channels), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_channels);
+        ggml_set_name(state, "state");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * xt = ggml_transpose(ctx, x);
+        ggml_set_name(xt, "x_t");
+        ggml_tensor * out = ggml_concat(ctx, state, xt, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_concat : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -8938,6 +8965,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {6, 5, 4, 3}, dim, false));
         test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {6, 5, 4, 3}, dim, true));
     }
+
+    for (int64_t n_tokens : { 1, 2, 4, 5, 33, 512 }) {
+        test_cases.emplace_back(new test_concat_transpose(3, 10240, n_tokens));
+    }
+    test_cases.emplace_back(new test_concat_transpose(3, 100, 7));
 
     for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, false));

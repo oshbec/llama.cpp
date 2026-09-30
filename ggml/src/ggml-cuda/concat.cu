@@ -200,7 +200,15 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         if constexpr (sizeof(T) == sizeof(uint32_t)) {
-            const bool transpose_dim0 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+            // DGX Spark, and RDNA4 under HIP: the qwen35 GDN conv-state concat at n_seq_tokens > 1
+            // (MTP verify) otherwise hits concat_non_cont at ~6.8x the 1-token cost.
+            const int  concat_cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+#if defined(GGML_USE_HIP)
+            const bool concat_fast_cc = GGML_CUDA_CC_IS_RDNA4(concat_cc);
+#else
+            const bool concat_fast_cc = concat_cc == GGML_CUDA_CC_DGX_SPARK;
+#endif // defined(GGML_USE_HIP)
+            const bool transpose_dim0 = concat_fast_cc &&
                 dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[0] <= 8 &&
                 src0->nb[0] == sizeof(uint32_t) && src0->nb[1] == (uint64_t) src0->ne[0]*sizeof(uint32_t) &&
